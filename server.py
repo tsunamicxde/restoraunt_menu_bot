@@ -3,21 +3,22 @@ import psycopg2
 import json
 import re
 
-from config import host, port, db_name, user, password, TOKEN, PAYMENTS_TOKEN
+from config import host, port, db_name, user, password, TOKEN, PAYMENTS_TOKEN, channel_name
 from menu import all_soups, all_meat, all_salads, all_snacks, all_desserts, \
                  all_coffee, all_alcohol_free, all_alcohol, all_hookah
 
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types.message import ContentType
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.dispatcher import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 logging.basicConfig(level=logging.INFO)
 dp.middleware.setup(LoggingMiddleware())
+
 
 conn = psycopg2.connect(
     host=host,
@@ -65,60 +66,69 @@ def call_menu():
 
 
 @dp.message_handler(commands=['start', 'help'])
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: types.Message):
     menu_keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
     menu_keyboard.row("Меню", "Мой заказ")
 
     user_id = message.chat.id
-    async with state.proxy() as data:
-        data['user_id'] = user_id
     await message.reply("Здравствуйте! Я бот, который запишет ваш заказ\n\n", reply_markup=menu_keyboard)
     keyboard = call_menu()
     await message.reply("Для заказа выберите интересующую вас категорию в меню:\n",
                         reply_markup=keyboard)
 
-    insert_query = '''
-        INSERT INTO orders (user_id)
-        VALUES (%s)
-        ON CONFLICT (user_id) DO UPDATE
-        SET user_id = EXCLUDED.user_id
-        RETURNING user_id;
-    '''
+    try:
+        insert_query = '''
+                INSERT INTO orders (user_id)
+                VALUES (%s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET user_id = EXCLUDED.user_id
+                RETURNING user_id;
+            '''
 
-    cursor.execute(insert_query, (user_id,))
-    conn.commit()
+        cursor.execute(insert_query, (user_id,))
+        conn.commit()
+    except psycopg2.Error:
+        conn.rollback()
+        await message.reply("Что-то пошло не так")
 
 
 @dp.message_handler(lambda message: re.match(r'/del\d+', message.text))
 async def delete_dish(message: types.Message):
     user_id = message.chat.id
     try:
-        index = int(message.text[4:])
+        try:
+            index = int(message.text[4:])
 
-        cursor.execute("SELECT \"order\" FROM orders WHERE user_id = %s;", (user_id, ))
-        order = cursor.fetchone()[0]
+            cursor.execute("SELECT \"order\" FROM orders WHERE user_id = %s;", (user_id,))
+            order = cursor.fetchone()[0]
 
-        if 0 <= index < len(order):
-            deleted_dish_list = order.pop(index)
-            new_data = json.dumps(order)
-            cursor.execute("UPDATE orders SET \"order\" = %s WHERE user_id = %s;", (new_data, user_id))
-            conn.commit()
+            if 0 <= index < len(order):
+                deleted_dish_list = order.pop(index)
+                new_data = json.dumps(order)
+                try:
+                    cursor.execute("UPDATE orders SET \"order\" = %s WHERE user_id = %s;", (new_data, user_id))
+                    conn.commit()
 
-            await message.reply(f"Вы успешно удалили {list(deleted_dish_list.keys())[0]} стоимостью "
-                                f"{list(deleted_dish_list.values())[0]} из заказа.")
-            update_query = '''
-                                UPDATE orders
-                                SET
-                                    cost = cost - %s
-                                WHERE user_id = %s;
-                           '''
+                    await message.reply(f"Вы успешно удалили {list(deleted_dish_list.keys())[0]} стоимостью "
+                                        f"{list(deleted_dish_list.values())[0]} из заказа.")
+                    update_query = '''
+                                                            UPDATE orders
+                                                            SET
+                                                                cost = cost - %s
+                                                            WHERE user_id = %s;
+                                                       '''
 
-            cursor.execute(update_query, (list(deleted_dish_list.values())[0], user_id))
-            conn.commit()
-            keyboard = call_menu()
-            deleted_dish_list.clear()
-            await message.reply("Выберите интересующую вас категорию в меню:\n",
-                                reply_markup=keyboard)
+                    cursor.execute(update_query, (list(deleted_dish_list.values())[0], user_id))
+                    conn.commit()
+                except psycopg2.Error:
+                    conn.rollback()
+                    await message.reply("Что-то пошло не так")
+                keyboard = call_menu()
+                deleted_dish_list.clear()
+                await message.reply("Выберите интересующую вас категорию в меню:\n",
+                                    reply_markup=keyboard)
+        except psycopg2.Error:
+            await message.reply("Что-то пошло не так")
         else:
             await message.reply("Указанный индекс недопустим.")
     except (IndexError, ValueError):
@@ -127,6 +137,7 @@ async def delete_dish(message: types.Message):
 
 @dp.callback_query_handler(lambda callback_query: True)
 async def callback(call):
+    user_id = call.message.chat.id
     await bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
     if call.data in all_menu_categories.keys():
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -141,6 +152,32 @@ async def callback(call):
         go_back = types.InlineKeyboardButton("Назад <<", callback_data="go_back")
         markup.add(go_back)
         await bot.send_message(call.message.chat.id, f"Меню: ", reply_markup=markup)
+    elif call.data == "accept_pay":
+        try:
+            cursor.execute("SELECT \"order\", cost FROM orders WHERE user_id = %s;", (user_id,))
+            row = cursor.fetchone()
+            current_orders = row[0]
+            current_cost = row[1]
+
+            order_text = ""
+            for current_order in current_orders:
+                for key, value in current_order.items():
+                    order_text += f"\n{key} - {value} руб. /del{current_orders.index(current_order)}"
+
+            price = types.LabeledPrice(label="Стоимость заказа", amount=current_cost * 100)
+
+            await bot.send_invoice(call.message.chat.id,
+                                   title="Оформление заказа",
+                                   description="Оплата стоимости заказа",
+                                   provider_token=PAYMENTS_TOKEN,
+                                   currency="rub",
+                                   is_flexible=False,
+                                   prices=[price],
+                                   start_parameter="order_pay",
+                                   payload="order-payload")
+        except psycopg2.Error:
+            await bot.send_message(call.message.chat.id, "Что-то пошло не так")
+
     elif call.data == "go_back":
         keyboard = call_menu()
         await bot.send_message(call.message.chat.id, "Выберите интересующую вас категорию в меню:\n",
@@ -152,25 +189,33 @@ async def callback(call):
                     if call.data in key:
                         user_id = call.message.chat.id
 
-                        update_query = '''
-                                            UPDATE orders
-                                            SET 
-                                                "order" = "order" || %s::jsonb,
-                                                cost = cost + %s
-                                            WHERE user_id = %s;
-                                       '''
+                        try:
+                            update_query = '''
+                                                                        UPDATE orders
+                                                                        SET 
+                                                                            "order" = "order" || %s::jsonb,
+                                                                            cost = cost + %s
+                                                                        WHERE user_id = %s;
+                                                                   '''
 
-                        cursor.execute(update_query, (json.dumps({key: value}), value, user_id))
-                        conn.commit()
+                            cursor.execute(update_query, (json.dumps({key: value}), value, user_id))
+                            conn.commit()
+                        except psycopg2.Error:
+                            conn.rollback()
+                            await bot.send_message(call.message.chat.id, "Что-то пошло не так")
 
-                        cursor.execute("SELECT \"order\" FROM orders WHERE user_id = %s;", (user_id,))
-                        current_data = cursor.fetchone()[0]
+                        try:
+                            cursor.execute("SELECT \"order\" FROM orders WHERE user_id = %s;", (user_id,))
+                            current_data = cursor.fetchone()[0]
 
-                        target_dict = {key: value}
+                            target_dict = {key: value}
 
-                        index = current_data.index(target_dict)
-                        await bot.send_message(call.message.chat.id, f"Вы добавили {key} в заказ. Стоимость: {value}\n"
-                                                                     f"Удалить блюдо: /del{index}")
+                            index = current_data.index(target_dict)
+                            await bot.send_message(call.message.chat.id,
+                                                   f"Вы добавили {key} в заказ. Стоимость: {value}\n"
+                                                   f"Удалить блюдо: /del{index}")
+                        except psycopg2.Error:
+                            await bot.send_message(call.message.chat.id, "Что-то пошло не так")
                         keyboard = call_menu()
                         await bot.send_message(call.message.chat.id,
                                                "Выберите интересующую вас категорию в меню:\n",
@@ -185,18 +230,67 @@ async def text(message: types.Message):
         await message.reply("Выберите интересующую вас категорию в меню:\n",
                             reply_markup=keyboard)
     elif message.text == "Мой заказ":
+        try:
+            cursor.execute("SELECT \"order\", cost FROM orders WHERE user_id = %s;", (user_id,))
+            row = cursor.fetchone()
+            current_orders = row[0]
+            current_cost = row[1]
+
+            if current_cost > 0:
+                order_text = "Ваш заказ:\n"
+                for current_order in current_orders:
+                    for key, value in current_order.items():
+                        order_text += f"\n{key} - {value} руб. /del{current_orders.index(current_order)}"
+
+                order_text += f"\n\nОбщая стоимость: {current_cost}"
+
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                accept_pay_button = types.InlineKeyboardButton("Оплатить заказ", callback_data="accept_pay")
+                markup.add(accept_pay_button)
+                await message.reply(order_text, reply_markup=markup)
+            else:
+                await message.reply("Ваш заказ пуст")
+        except psycopg2.Error:
+            await bot.send_message(message.chat.id, "Что-то пошло не так")
+
+
+@dp.pre_checkout_query_handler(lambda query: True)
+async def pre_checkout_query(pre_checkout_q: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+
+@dp.message_handler(content_types=ContentType.SUCCESSFUL_PAYMENT)
+async def successful_payment(message: types.Message):
+    user_id = message.chat.id
+
+    await bot.send_message(message.chat.id,
+                           f"Платёж на сумму {message.successful_payment.total_amount // 100}"
+                           f" {message.successful_payment.currency} прошёл успешно")
+
+    try:
         cursor.execute("SELECT \"order\", cost FROM orders WHERE user_id = %s;", (user_id,))
         row = cursor.fetchone()
+
         current_orders = row[0]
         current_cost = row[1]
 
-        order_text = "Ваш заказ:\n"
+        username = message.from_user.first_name
+        order_text = f"Пользователь {username} оплатил заказ:\n"
         for current_order in current_orders:
             for key, value in current_order.items():
                 order_text += f"\n{key} - {value} руб. /del{current_orders.index(current_order)}"
 
-        order_text += f"\n\nОбщая стоимость: {current_cost}"
-        await message.reply(order_text)
+        order_text += f"\n\nНа сумму: {current_cost}"
+        await bot.send_message(chat_id=channel_name, text=order_text)
+    except psycopg2.Error:
+        await bot.send_message(message.chat.id, "Что-то пошло не так")
+    try:
+        cursor.execute("UPDATE orders SET \"order\" = DEFAULT, cost = DEFAULT")
+        conn.commit()
+    except psycopg2.Error:
+        conn.rollback()
+        await bot.send_message(message.chat.id, "Что-то пошло не так")
+
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)

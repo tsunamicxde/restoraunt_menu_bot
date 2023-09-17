@@ -5,4 +5,6 @@ host = 'YOUR_DB_HOST'
 port = 'YOUR_DB_PORT'
 db_name = 'YOUR_DB_NAME'
 user = 'YOUR_USERNAME'
-password = 'YOUR_PASSWORD'
+password = 'YOUR_DB_PASSWORD'
+
+channel_name = "YOUR_TELEGRAM_CHANNEL_NAME"
